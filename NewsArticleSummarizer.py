@@ -1,125 +1,149 @@
-import streamlit as st
-from transformers import pipeline
+import os
+from flask import Flask, render_template, request, jsonify
+from transformers import pipeline, AutoTokenizer
 import requests
 import re
+import torch
+from werkzeug.middleware.proxy_fix import ProxyFix
+from dotenv import load_dotenv
+import warnings
 
-# Initialize the text summarization pipeline
-pipe = pipeline("text2text-generation", model="dheerajnarne/textsummarizer", device=-1)
+# Load environment variables
+load_dotenv()
 
-# Set the page configuration for Streamlit
-st.set_page_config(
-    page_title="News Summarizer",
-    page_icon="🗞",
-    layout="centered",
-    initial_sidebar_state="expanded",
-    menu_items={
-        "About": "This is a news summarization app built with Streamlit and Hugging Face Transformers."
-    },
-)
+# Initialize Flask app
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# Apply dark theme using custom CSS
-st.markdown(
-    """
-    <style>
-    body {
-        background-color: #1e1e2f;
-        color: #ffffff;
-    }
-    .stTextInput label, .stButton button {
-        color: #ffffff;
-    }
-    .stButton button {
-        background-color: #4CAF50;
-        border: none;
-        color: white;
-        padding: 10px 20px;
-        text-align: center;
-        text-decoration: none;
-        display: inline-block;
-        font-size: 16px;
-        margin: 4px 2px;
-        cursor: pointer;
-        border-radius: 4px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# Configuration
+NEWS_API_KEY = # Use your own tokens
+HF_TOKEN =   # Use your own tokens
+MODEL_NAME = "dheerajnarne/textsummarizer"
+DEVICE = 0 if torch.cuda.is_available() else -1
 
-# Function to clean article content
-def clean_content(content):
-    if not content:
-        return ""
-    # Remove URLs, special characters, and unnecessary whitespace
-    content = re.sub(r"http\S+|www\S+|https\S+", "", content, flags=re.MULTILINE)
-    content = re.sub(r"[^\w\s.,]", "", content)
-    return content.strip()
+# Suppress warnings
+warnings.filterwarnings("ignore", message="You set `add_prefix_space`")
+warnings.filterwarnings("ignore", message="The following `model_kwargs`")
 
-# Function to fetch news articles using NewsAPI
-def fetch_news_articles(keyword):
-    api_key = "6fb86e5265d340088783deb29eb146f5"  # Replace with your NewsAPI key
-    url = f"https://newsapi.org/v2/everything?q={keyword}&language=en&sortBy=publishedAt&apiKey={api_key}"
-    response = requests.get(url)
+def initialize_model():
+    """Initialize the text summarization pipeline with proper error handling"""
+    try:
+        # Initialize tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_NAME,
+            use_fast=True,
+            token=HF_TOKEN
+        )
+        
+        # Initialize model with corrected parameters
+        model = pipeline(
+            task="text2text-generation",
+            model=MODEL_NAME,
+            tokenizer=tokenizer,
+            device=DEVICE,
+            token=HF_TOKEN,
+            truncation=True
+        )
+        print("✓ Model loaded successfully")
+        return model, True
+        
+    except Exception as e:
+        print(f"Failed to load model: {str(e)}")
+        return None, False
+
+# Initialize model
+pipe, MODEL_LOADED = initialize_model()
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        keyword = request.form.get('keyword', '').strip()
+        if not keyword:
+            return render_template('index.html', 
+                                error="Please enter a keyword",
+                                model_available=MODEL_LOADED)
+        
+        articles = fetch_news_articles(keyword)
+        if not articles:
+            return render_template('index.html', 
+                                error="No articles found for the given keyword",
+                                model_available=MODEL_LOADED)
+        
+        # Summarize articles
+        for article in articles:
+            if article["content"] and len(article["content"]) > 100:
+                article["summary"] = summarize_text(article["content"])
+        
+        return render_template('index.html', 
+                            articles=articles, 
+                            keyword=keyword,
+                            model_available=MODEL_LOADED)
     
-    if response.status_code == 200:
+    return render_template('index.html', model_available=MODEL_LOADED)
+
+def fetch_news_articles(keyword):
+    """Fetch news articles from NewsAPI"""
+    try:
+        params = {
+            'q': keyword,
+            'language': 'en',
+            'sortBy': 'publishedAt',
+            'apiKey': NEWS_API_KEY,
+            'pageSize': 5
+        }
+        response = requests.get(
+            "https://newsapi.org/v2/everything",
+            params=params,
+            timeout=15
+        )
+        response.raise_for_status()
+        
         data = response.json()
-        articles = [
-            {
-                "headline": article["title"],
-                "link": article["url"],
-                "content": clean_content(article.get("content") or article.get("description", ""))
-            }
-            for article in data.get("articles", [])[:5]  # Get top 5 articles
-        ]
-        return articles
-    else:
+        return [{
+            "headline": article["title"],
+            "link": article["url"],
+            "content": clean_content(article.get("content") or article.get("description", "")),
+            "source": article.get("source", {}).get("name", "Unknown"),
+            "publishedAt": format_date(article.get("publishedAt", ""))
+        } for article in data.get("articles", [])]
+    
+    except Exception as e:
+        print(f"NewsAPI Error: {str(e)}")
         return []
 
-# App title and description
-st.title("🗞 News Summarizer")
-st.markdown(
-    """
-    Welcome to the **News Summarizer**! Enter a topic below, and our app will fetch related news articles and summarize them for you.
-    """
-)
+def summarize_text(text):
+    """Generate summary using the loaded model"""
+    if not MODEL_LOADED or not pipe:
+        return None
+    
+    try:
+        result = pipe(
+            text,
+            max_length=150,
+            min_length=50,
+            do_sample=False,
+            truncation=True
+        )
+        return result[0]["generated_text"]
+    except Exception as e:
+        print(f"Summarization Error: {str(e)}")
+        return None
 
-# Input keyword from the user
-keyword = st.text_input(
-    "Enter a topic or keyword:",
-    placeholder="e.g., Indian economy, technology trends, climate change...",
-)
+def clean_content(content):
+    """Clean article content"""
+    if not content:
+        return ""
+    content = re.sub(r"http\S+|www\S+|https\S+", "", content, flags=re.MULTILINE)
+    content = re.sub(r"[^\w\s.,\-']", "", content)
+    return re.sub(r"\s+", " ", content).strip()
 
-# Fetch and summarize news on button click
-if st.button("Fetch and Summarize News"):
-    if keyword.strip():
-        with st.spinner("Fetching news articles..."):
-            articles = fetch_news_articles(keyword)
+def format_date(date_str):
+    """Format date string"""
+    from datetime import datetime
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").strftime("%B %d, %Y at %H:%M")
+    except:
+        return date_str
 
-        if articles:
-            st.markdown("### Top News Articles:")
-            for i, article in enumerate(articles, 1):
-                st.markdown(f"**{i}. {article['headline']}**")
-                st.markdown(f"[Read more]({article['link']})")
-
-                if article["content"] and len(article["content"]) > 100:  # Check if content is long enough
-                    with st.spinner("Summarizing..."):
-                        summary = pipe(
-                            article["content"], 
-                            max_length=150,  # Increased summary length
-                            min_length=50,  # Minimum summary length
-                            do_sample=False,
-                            skip_special_tokens=True,
-                        )[0]["generated_text"]
-                    st.markdown(f"**Summary:** {summary}")
-                else:
-                    st.warning("Content is too short for summarization or no content available.")
-        else:
-            st.warning("No articles found for the given keyword.")
-    else:
-        st.warning("Please enter a keyword.")
-
-# Footer
-st.markdown("---")
-st.markdown(
-    "Developed by **Narne Dheeraj Balaram** using [Hugging Face Transformers](https://huggingface.co/) and [Streamlit](https://streamlit.io/)."
-)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
